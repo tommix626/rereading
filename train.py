@@ -76,6 +76,9 @@ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch si
 block_size = 1024
 block_align = False # if True, snap each random window to a multiple of block_size
                     # (for fixed-length self-contained examples, e.g. MQAR; native path only)
+ar_eval_acc = False # if True, also report recall accuracy at MQAR answer positions
+ar_num_queries = 0  # number of trailing (query,answer) pairs per example; answers are
+                    # predicted at local positions [block_size-2*Q + 2*t for t in 0..Q-1]
 # model (SwiGLU MLP, RMSNorm, no biases, tied embeds; mixer chosen below)
 n_layer = 12
 n_embd = 768
@@ -332,8 +335,29 @@ def estimate_loss():
     val_loss = losses.mean()
     if ddp:
         torch.distributed.all_reduce(val_loss, op=torch.distributed.ReduceOp.AVG)
+    out = {'val': val_loss.item()}
+    # Optional: recall accuracy at MQAR answer positions (answers are tiny fraction
+    # of a long sequence, so val loss alone won't reveal retrieval ability).
+    if ar_eval_acc and ar_num_queries > 0:
+        base = block_size - 2 * ar_num_queries
+        positions = torch.arange(base, block_size - 1, 2, device=device)  # query-key positions
+        raw = model.module if ddp else model
+        correct = torch.zeros((), device=device)
+        total = torch.zeros((), device=device)
+        for k in range(eval_iters):
+            X, Y = get_batch('val')
+            with ctx:
+                lg = raw.logits_at(X, positions)          # [B, Q, V]
+            pred = lg.argmax(dim=-1)
+            tgt = Y[:, positions]                          # answer tokens
+            correct += (pred == tgt).sum()
+            total += tgt.numel()
+        if ddp:
+            torch.distributed.all_reduce(correct, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
+        out['val_acc'] = (correct / total).item()
     model.train()
-    return {'val': val_loss.item()}
+    return out
 
 # learning rate schedule — mirrors lm-engine CosineScheduler (scheduler.py:90-106) exactly
 def get_lr(it):
@@ -390,14 +414,18 @@ while True:
     if eval_during_training and iter_num % eval_interval == 0:
         losses = estimate_loss()
         if master_process:
-            print(f"step {iter_num}: val/loss {losses['val']:.4f}")
+            acc_str = f" val/acc {losses['val_acc']:.4f}" if 'val_acc' in losses else ""
+            print(f"step {iter_num}: val/loss {losses['val']:.4f}{acc_str}")
             if wandb_log:
-                wandb.log({
+                log_d = {
                     "iter": iter_num,
                     "val/loss": losses['val'],
                     "lr": lr,
                     "mfu": running_mfu*100,
-                }, step=iter_num)
+                }
+                if 'val_acc' in losses:
+                    log_d["val/acc"] = losses['val_acc']
+                wandb.log(log_d, step=iter_num)
     if iter_num == 0 and eval_only:
         break
 

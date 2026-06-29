@@ -216,6 +216,18 @@ class GPT(nn.Module):
         logits = self.lm_head(x[:, [-1], :])
         return logits, None
 
+    @torch.no_grad()
+    def logits_at(self, idx, positions):
+        """Eval helper: per-position logits at `positions` (1D LongTensor of time
+        indices, shared across the batch). Returns [B, len(positions), vocab].
+        Used to score answer-position recall accuracy without materializing the
+        full [B, T, vocab] logits tensor."""
+        x = self.transformer.wte(idx)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        return self.lm_head(x[:, positions, :])
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, eps=1e-8):
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         # GDN marks A_log and dt_bias with `_no_weight_decay = True` (see fla.layers.gated_deltanet).
