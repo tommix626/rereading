@@ -20,3 +20,5 @@ out/
 torchelastic_*/
 torchinductor_*/
 tmp*wandb*/
+CLAUDE.md
+slurm/

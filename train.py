@@ -74,6 +74,8 @@ save_checkpoint = True
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+block_align = False # if True, snap each random window to a multiple of block_size
+                    # (for fixed-length self-contained examples, e.g. MQAR; native path only)
 # model (SwiGLU MLP, RMSNorm, no biases, tied embeds; mixer chosen below)
 n_layer = 12
 n_embd = 768
@@ -142,6 +144,8 @@ else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
+    ddp_rank = 0
+    ddp_local_rank = 0
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
@@ -208,11 +212,15 @@ def get_batch(split):
     elif split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
         ix = torch.randint(len(data) - block_size, (batch_size,), generator=rng)
+        if block_align:
+            ix = (ix // block_size) * block_size  # snap to example boundaries
         x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
         ix = torch.randint(len(data) - block_size, (batch_size,), generator=rng)
+        if block_align:
+            ix = (ix // block_size) * block_size  # snap to example boundaries
         x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
