@@ -1,78 +1,73 @@
 # GDN-minimal-BlueVela
 
-Minimal training setup for Gated DeltaNet (GDN) research. Forked from nanoGPT
-(via [`futureLM-nanoGPTLead`](https://github.com/OliverSieberling/futureLM-nanoGPTLead)
-@`linear-lead@467d8a0`) and stripped down to: one model file, one training
-script, two configs (GDN and a param-matched softmax-attention baseline).
+Minimal harness for **GDN vs softmax** on Zoology-style MQAR. Same 4-layer d=256
+GPT (SwiGLU, RMSNorm, tied embeds); only the sequence mixer differs.
 
 ## Layout
 
 ```
-model.py                       GPT with mixer={'gdn','softmax'} switch
-train.py                       Training loop (DDP, fixed-set val, no checkpoints by default)
-configurator.py                nanoGPT's CLI-override exec pattern
-config/
-  train_gdn.py                 Default GDN run (~190M, "200M-gdn")
-  train_transformer.py         Param-matched softmax baseline ("200M-transformer")
-data/
-  megatron.py                  Megatron .bin/.idx reader
-scripts/
-  submit_lsf.sh                LSF launcher (single node × 8 GPUs)
+model.py, train.py, configurator.py
+config/lc_len_gdn.py          GDN MQAR config
+config/lc_len_transformer.py  param-matched softmax baseline
+data/mqar/zoology.py          MQAR generator (masked labels, '?' separator)
+data/mqar/gen_fixed.py        writes data/mqar_{...}/
+scripts/gen_lc_len_data.sh    lc3 data (Q=1, seq len S)
+scripts/sweep_lc_len.sh       lc3 training sweep
+scripts/gen_mqar_mq_sweep.sh  mq4 data (context pairs S, Q=S/4)
+scripts/sweep_mqar_mq.sh      mq4 training sweep
+scripts/plot_lc_curves.py     plot slurm/{lc3,mq4}_*.log
 ```
 
-## Default model
+## Active experiments
 
-Both configs use the same shape (16 layers × 768 hidden, FFN 2048, block 4096,
-SwiGLU + RMSNorm + tied embeds). Only the mixer differs:
+### lc3 — length sweep, single query
 
-| | GDN (default) | softmax baseline |
-|---|---|---|
-| `mixer` | `'gdn'` | `'softmax'` |
-| Heads / head_dim | 6 × 128 | 6 × 128 (via `n_head=6`) |
-| Key / value | `key_dim = val_dim = 768` (`expand_v=1`) | standard `d × d` |
-| Gate | `use_gate=False` (no SiLU output gate) | n/a |
-| Positional info | short-conv (k=4) + GDN recurrence | RoPE (`rope_theta=10000`) |
-| Mixer params/layer | ~4.22·d² | 4.00·d² |
-
-Param totals match to <0.5% — any loss delta is attributable to the mixer.
-
-## Training recipe
-
-| | value |
-|---|---|
-| Tokens / step | 524,288 (≈500k; `mbs=8`, `grad_accum=16` global, `world=8`, `block=4096`) |
-| Iters | 19,000 → ~9.96B tokens total |
-| Optimizer | AdamW, lr=3e-4, β=(0.9, 0.95), wd=0.1, **eps=1e-10** (not 1e-8), grad_clip=1.0 |
-| LR schedule | warmup 1500 → cosine to 0.1·lr over 17,500 → hold |
-| Validation | every 500 steps, fixed ~20M-token set, sharded across DDP ranks |
-| Checkpoints | disabled by default (`save_checkpoint=False`) |
-| Data | 50/50 blend of `/proj/datasets/granite-4-datasets-megatron-merged/web-nemotron-cc-hq-p2_{0,1}` |
-| Compile | `torch.compile` on |
-
-## Run
+| Setting | Value |
+|---------|-------|
+| S | total sequence length ∈ {16, 32, 64, 128} |
+| Q | 1 |
+| Train / val | 400k / 2k |
+| batch | 256, max_iters 20k |
+| Data | `data/mqar_s{S}_q1/` |
 
 ```bash
-# GDN (default)
-bash scripts/submit_lsf.sh                                          # → 200M-gdn
-
-# softmax baseline
-bash scripts/submit_lsf.sh 200M-transformer config/train_transformer.py
-
-# arbitrary run name / config
-bash scripts/submit_lsf.sh <wandb-run-name> <config-path>
+bash scripts/gen_lc_len_data.sh
+SLURM=1 bash scripts/sweep_lc_len.sh
+python scripts/plot_lc_curves.py lc3 16,32,64,128
 ```
 
-The submit script's first arg sets `WANDB_NAME` (run name). The second arg is
-the config path; CLI overrides like `--lr=1e-4` work too via `configurator.py`.
+### mq4 — multi-query, context-pair sweep
 
-Launch prerequisites (defined inside `scripts/submit_lsf.sh`):
-- `/u/osieberl/dynFLA/nanoGPT/.env` — WandB key
-- `/u/osieberl/futureLM/nanoGPTLead/.venv/` — Python env with `flash-linear-attention` installed
+| Setting | Value |
+|---------|-------|
+| S | **context KV pairs** (before `?`) ∈ {16, 32, 64, 128} |
+| Q | S / 4 |
+| seq_len | 2S + 1 + 2Q (padded to even) |
+| Train / val | 400k / 2k |
+| Data | `data/mqar_ctx{S}_q{Q}/` |
 
-## Validation details
+```bash
+bash scripts/gen_mqar_mq_sweep.sh
+SLURM=1 bash scripts/sweep_mqar_mq.sh
+python scripts/plot_lc_curves.py mq4 16,32,64,128
+```
 
-Custom fixed-set validation: `estimate_loss()` reseeds a dedicated
-`_val_rng` to `val_seed + ddp_rank` at the start of every call, so every eval
-draws the same positions. Per-rank mean losses are all-reduced into the global
-mean. Default `val_seed=1234`. To resize the eval set, change `eval_iters` —
-total tokens per eval is `world_size × eval_iters × batch_size × block_size`.
+## Model (~3.7M params)
+
+4 layers, n_embd=256, 4 heads, vocab=2048, SwiGLU FFN=704.
+Softmax path: causal MHA + RoPE (θ=10000). GDN path: `fla` GatedDeltaNet, no RoPE.
+
+## Run (single GPU debug)
+
+```bash
+conda activate gdn   # needs flash-linear-attention + CUDA
+python train.py config/lc_len_gdn.py \
+  --dataset=mqar_s16_q1 --block_size=16 --mqar_masked=True --vocab_size=2048 \
+  --batch_size=256 --compile=False --max_iters=100
+```
+
+## Tests
+
+```bash
+python data/mqar/test_zoology.py
+```

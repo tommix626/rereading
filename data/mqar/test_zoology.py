@@ -99,6 +99,22 @@ def test_bin_roundtrip():
     assert np.array_equal(y, labels.astype(np.int32))
 
 
+def test_pool_mq4_ctx():
+    """mq4 sweep: S = context pairs, Q = S//4, derived seq_len."""
+    for ctx in (16, 32, 64, 128):
+        Q = ctx // 4
+        seq = 2 * ctx + 1 + 2 * Q
+        if seq % 2:
+            seq += 1
+        inputs, labels = build_pool_examples(
+            4, vocab_size=2048, input_seq_len=seq, num_queries=Q, seed=ctx,
+        )
+        verify_pool_invariants(
+            inputs, labels, vocab_size=2048, num_queries=Q,
+            context_size=2 * ctx, sep_token_id=2047, val_hi=2047,
+        )
+
+
 if __name__ == '__main__':
     test_sanity_config()
     test_canonical_config()
@@ -106,5 +122,6 @@ if __name__ == '__main__':
     test_no_full_ntp_labels()
     test_query_separator()
     test_pool_q1()
+    test_pool_mq4_ctx()
     test_bin_roundtrip()
     print('all zoology MQAR tests passed')
