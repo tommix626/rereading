@@ -1,51 +1,88 @@
-r"""Parameterized MQAR generator for the difficulty sweep.
+r"""Generate Zoology-style MQAR bins with answer-token-only labels (-100 elsewhere).
 
-Writes data/mqar_p{P}/{train,val}.bin for P key->value bindings and Q queries
-(default Q=P). Example length L = 2*P + 2*Q; train with block_size=L,
-block_align=True. Same vocab layout as data/mqar/prepare.py:
-    keys   in [0, NUM_KEYS), values in [NUM_KEYS, NUM_KEYS+NUM_VALS).
+Writes data/mqar_p{P}/ or data/mqar_s{S}_p{P}/ with:
+  {train,val}_inputs.bin  (int32 token ids)
+  {train,val}_labels.bin  (int32, -100 on non-answer positions)
+  meta.pkl
 
-Knobs via env vars: NUM_PAIRS, NUM_QUERIES, N_TRAIN, N_VAL.
-  NUM_PAIRS=1  python data/mqar/gen.py   # easiest: one binding, one query
+Env vars (defaults match Zoology canonical where noted):
+  VOCAB_SIZE=8192
+  INPUT_SEQ_LEN=256       # block_size for training (= shifted sequence length)
+  NUM_PAIRS=64            # num_kv_pairs
+  NUM_QUERIES unused (always one query per KV pair)
+  N_TRAIN=100000
+  N_VAL=2000
+  NUM_PASSES=1
+  POWER_A=0.01
+  RANDOM_NON_QUERIES=1
+  USE_QUERY_SEP=1         # place a '?' token (id vocab_size-1) between context and queries
+  SEED=0
+
+Examples:
+  NUM_PAIRS=8 INPUT_SEQ_LEN=64 VOCAB_SIZE=1024 N_TRAIN=50000 python data/mqar/gen.py
+  NUM_PAIRS=64 python data/mqar/gen.py
 """
 import os
-import numpy as np
+import pickle
+import sys
 
-NUM_KEYS = 256
-NUM_VALS = 256
-P = int(os.environ.get('NUM_PAIRS', '8'))
-Q = int(os.environ.get('NUM_QUERIES', str(P)))
-N_TRAIN = int(os.environ.get('N_TRAIN', '40000'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from zoology import IGNORE_INDEX, build_examples, default_sep_token_id, write_split_bins
+
+VOCAB_SIZE = int(os.environ.get('VOCAB_SIZE', '8192'))
+INPUT_SEQ_LEN = int(os.environ.get('INPUT_SEQ_LEN', os.environ.get('SEQ_LEN', '258')))
+P = int(os.environ.get('NUM_PAIRS', '64'))
+N_TRAIN = int(os.environ.get('N_TRAIN', '100000'))
 N_VAL = int(os.environ.get('N_VAL', '2000'))
-SEED = 7
+NUM_PASSES = int(os.environ.get('NUM_PASSES', '1'))
+POWER_A = float(os.environ.get('POWER_A', '0.01'))
+RANDOM_NON_QUERIES = os.environ.get('RANDOM_NON_QUERIES', '1') not in ('0', 'false', 'False')
+USE_QUERY_SEP = os.environ.get('USE_QUERY_SEP', '1') not in ('0', 'false', 'False')
+SEED = int(os.environ.get('SEED', '0'))
 
-assert P <= NUM_KEYS, "need P distinct keys"
-VOCAB = NUM_KEYS + NUM_VALS
-L = 2 * P + 2 * Q
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUTDIR = os.path.join(HERE, '..', f'mqar_p{P}')
-
-
-def build(n_examples, seed):
-    r = np.random.default_rng(seed)
-    out = np.empty((n_examples, L), dtype=np.uint16)
-    for e in range(n_examples):
-        keys = r.choice(NUM_KEYS, size=P, replace=False)
-        vals = r.integers(0, NUM_VALS, size=P) + NUM_KEYS
-        out[e, 0:2 * P:2] = keys
-        out[e, 1:2 * P:2] = vals
-        qidx = r.integers(0, P, size=Q)
-        out[e, 2 * P + 0::2] = keys[qidx]
-        out[e, 2 * P + 1::2] = vals[qidx]
-    return out.reshape(-1)
+OUTDIR = os.path.join(HERE, '..', f'mqar_s{INPUT_SEQ_LEN}_p{P}')
 
 
 def main():
+    kw = dict(
+        vocab_size=VOCAB_SIZE,
+        input_seq_len=INPUT_SEQ_LEN,
+        num_kv_pairs=P,
+        num_passes=NUM_PASSES,
+        power_a=POWER_A,
+        random_non_queries=RANDOM_NON_QUERIES,
+        use_query_sep=USE_QUERY_SEP,
+    )
+    train_in, train_lab = build_examples(N_TRAIN, seed=SEED + 1, **kw)
+    val_in, val_lab = build_examples(N_VAL, seed=SEED + 2, **kw)
+
     os.makedirs(OUTDIR, exist_ok=True)
-    build(N_TRAIN, SEED + 1).tofile(os.path.join(OUTDIR, 'train.bin'))
-    build(N_VAL, SEED + 2).tofile(os.path.join(OUTDIR, 'val.bin'))
-    print(f"[mqar_p{P}] pairs={P} queries={Q} L={L} block_size={L} "
-          f"vocab={VOCAB}  answers={Q/L:.0%} of positions  -> {OUTDIR}")
+    write_split_bins(OUTDIR, 'train', train_in, train_lab)
+    write_split_bins(OUTDIR, 'val', val_in, val_lab)
+
+    meta = {
+        'vocab_size': VOCAB_SIZE,
+        'block_size': INPUT_SEQ_LEN,
+        'num_kv_pairs': P,
+        'num_passes': NUM_PASSES,
+        'power_a': POWER_A,
+        'random_non_queries': RANDOM_NON_QUERIES,
+        'use_query_sep': USE_QUERY_SEP,
+        'sep_token_id': default_sep_token_id(VOCAB_SIZE) if USE_QUERY_SEP else None,
+        'mqar_masked': True,
+        'ignore_index': IGNORE_INDEX,
+    }
+    with open(os.path.join(OUTDIR, 'meta.pkl'), 'wb') as f:
+        pickle.dump(meta, f)
+
+    ctx = 2 * P * NUM_PASSES
+    sep = 1 if USE_QUERY_SEP else 0
+    space = (INPUT_SEQ_LEN - ctx - sep) // 2
+    sep_note = f" sep_id={default_sep_token_id(VOCAB_SIZE)}" if USE_QUERY_SEP else ""
+    print(f"[mqar_s{INPUT_SEQ_LEN}_p{P}] vocab={VOCAB_SIZE} ctx_tokens={ctx}{sep_note} "
+          f"query_slots={space} supervised={P}/{INPUT_SEQ_LEN} "
+          f"ignore_index={IGNORE_INDEX} -> {OUTDIR}")
 
 
 if __name__ == '__main__':

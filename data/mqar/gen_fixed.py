@@ -1,63 +1,104 @@
-r"""Fixed-length MQAR for long-context retrieval (standard Zoology-style setup).
+r"""Long-context MQAR: pool of K bindings + Q queries at tail (masked labels).
 
-The context is a POOL of K distinct key->value pairs that fills the sequence;
-we then query a random subset of Q of them. The queried key's binding sits at a
-RANDOM position in the pool, so retrieval distance varies and there is genuine
-interference from the other K-1 bindings:
+Zoology-style answer-token-only CE. Writes {train,val}_inputs.bin and labels.
 
-    k1 v1 k2 v2 ............ kK vK   q1 a1 ... qQ aQ
-    \_____ pool of K random bindings ____/  \_ Q random queries _/   (total = S)
+Two sizing modes:
+  1) SEQ_LEN + NUM_QUERIES — total sequence length (lc length-sweep, Q=1).
+  2) POOL_PAIRS — user's S: number of KV pairs in context before '?' and queries;
+     Q = POOL_PAIRS // 4, seq_len = 2*POOL_PAIRS + 1 + 2*Q (padded to even).
 
-  K = (S - 2Q)/2 pool pairs   (grows with S -> more distractors + longer distance)
-  Q = number of retrievals (the "retrieval" knob: 1, 8, 64)
+Env vars:
+  SEQ_LEN=256 | POOL_PAIRS=16
+  NUM_QUERIES=1  (ignored when POOL_PAIRS is set; Q = POOL_PAIRS // 4)
+  VOCAB_SIZE=2048
+  N_TRAIN=40000
+  N_VAL=2000
+  DATASET_TAG=''  — optional suffix on output dir name
 
-Longer S => bigger pool + farther bindings => harder for a fixed-state recurrent
-model, easy for attention (direct access). Keys are distinct within an example
-(unambiguous), values random. Answers are predicted at local positions
-[S-2Q + 2t for t in 0..Q-1] -> matches train.py ar_num_queries scoring.
-
-Writes data/mqar_s{S}_q{Q}/{train,val}.bin. Env: SEQ_LEN, NUM_QUERIES.
+Example:
+  SEQ_LEN=64 NUM_QUERIES=1 python data/mqar/gen_fixed.py
+  POOL_PAIRS=16 python data/mqar/gen_fixed.py   # S=16 pairs, Q=4, seq_len=42
 """
 import os
-import numpy as np
+import pickle
+import sys
 
-NUM_KEYS = 1024          # big enough that the pool keys can be distinct
-NUM_VALS = 1024
-S = int(os.environ.get('SEQ_LEN', '256'))
-Q = int(os.environ.get('NUM_QUERIES', '8'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from zoology import IGNORE_INDEX, build_pool_examples, default_sep_token_id, write_split_bins
+
+VOCAB_SIZE = int(os.environ.get('VOCAB_SIZE', '2048'))
 N_TRAIN = int(os.environ.get('N_TRAIN', '40000'))
 N_VAL = int(os.environ.get('N_VAL', '2000'))
-SEED = 11
+USE_QUERY_SEP = os.environ.get('USE_QUERY_SEP', '1') not in ('0', 'false', 'False')
+RANDOM_NON_QUERIES = os.environ.get('RANDOM_NON_QUERIES', '1') not in ('0', 'false', 'False')
+SEED = int(os.environ.get('SEED', '11'))
+_DATASET_TAG = os.environ.get('DATASET_TAG', '')
 
-VOCAB = NUM_KEYS + NUM_VALS
-assert (S - 2 * Q) % 2 == 0 and S - 2 * Q > 0, "need S even and S > 2Q"
-K = (S - 2 * Q) // 2     # pool size
-assert Q <= K, f"need Q<=K; S={S},Q={Q} gives pool K={K}"
-assert K <= NUM_KEYS, f"pool K={K} exceeds NUM_KEYS={NUM_KEYS}; raise NUM_KEYS"
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUTDIR = os.path.join(HERE, '..', f'mqar_s{S}_q{Q}')
 
 
-def build(n, seed):
-    r = np.random.default_rng(seed)
-    out = np.empty((n, S), dtype=np.uint16)
-    for e in range(n):
-        keys = r.choice(NUM_KEYS, size=K, replace=False)          # distinct pool keys
-        vals = r.integers(0, NUM_VALS, size=K) + NUM_KEYS
-        out[e, 0:2 * K:2] = keys
-        out[e, 1:2 * K:2] = vals
-        qidx = r.integers(0, K, size=Q)                           # query random pool entries
-        out[e, S - 2 * Q + 0::2] = keys[qidx]
-        out[e, S - 2 * Q + 1::2] = vals[qidx]
-    return out.reshape(-1)
+def seq_len_from_pool_pairs(pool_pairs: int, num_queries: int, *, use_sep: bool = True) -> int:
+    """Total tokens: 2*pool_pairs + sep + 2*Q; pad by 1 if odd (zoology requires even)."""
+    sep_len = 1 if use_sep else 0
+    seq_len = 2 * pool_pairs + sep_len + 2 * num_queries
+    if seq_len % 2:
+        seq_len += 1
+    return seq_len
+
+
+def resolve_sizing():
+    """Return (seq_len, pool_pairs, num_queries, outdir_basename)."""
+    if os.environ.get('POOL_PAIRS'):
+        pool_pairs = int(os.environ['POOL_PAIRS'])
+        num_queries = pool_pairs // 4
+        assert num_queries >= 1, f"POOL_PAIRS={pool_pairs} too small for Q=POOL_PAIRS//4"
+        seq_len = seq_len_from_pool_pairs(pool_pairs, num_queries, use_sep=USE_QUERY_SEP)
+        name = f'mqar_ctx{pool_pairs}_q{num_queries}{_DATASET_TAG}'
+        return seq_len, pool_pairs, num_queries, name
+    seq_len = int(os.environ.get('SEQ_LEN', '256'))
+    num_queries = int(os.environ.get('NUM_QUERIES', '1'))
+    sep_len = 1 if USE_QUERY_SEP else 0
+    pool_pairs = (seq_len - sep_len - 2 * num_queries) // 2
+    name = f'mqar_s{seq_len}_q{num_queries}{_DATASET_TAG}'
+    return seq_len, pool_pairs, num_queries, name
 
 
 def main():
-    os.makedirs(OUTDIR, exist_ok=True)
-    build(N_TRAIN, SEED + 1).tofile(os.path.join(OUTDIR, 'train.bin'))
-    build(N_VAL, SEED + 2).tofile(os.path.join(OUTDIR, 'val.bin'))
-    print(f"[mqar_s{S}_q{Q}] S={S} pool_pairs={K} queries={Q} vocab={VOCAB} "
-          f"(avg query distance ~{K + Q}) -> {OUTDIR}")
+    seq_len, pool_pairs, num_queries, basename = resolve_sizing()
+    outdir = os.path.join(HERE, '..', basename)
+
+    kw = dict(
+        vocab_size=VOCAB_SIZE,
+        input_seq_len=seq_len,
+        num_queries=num_queries,
+        random_non_queries=RANDOM_NON_QUERIES,
+        use_query_sep=USE_QUERY_SEP,
+    )
+    train_in, train_lab = build_pool_examples(N_TRAIN, seed=SEED + 1, **kw)
+    val_in, val_lab = build_pool_examples(N_VAL, seed=SEED + 2, **kw)
+
+    os.makedirs(outdir, exist_ok=True)
+    write_split_bins(outdir, 'train', train_in, train_lab)
+    write_split_bins(outdir, 'val', val_in, val_lab)
+
+    meta = {
+        'vocab_size': VOCAB_SIZE,
+        'block_size': seq_len,
+        'pool_pairs': pool_pairs,
+        'num_queries': num_queries,
+        'use_query_sep': USE_QUERY_SEP,
+        'sep_token_id': default_sep_token_id(VOCAB_SIZE) if USE_QUERY_SEP else None,
+        'mqar_masked': True,
+        'ignore_index': IGNORE_INDEX,
+    }
+    with open(os.path.join(outdir, 'meta.pkl'), 'wb') as f:
+        pickle.dump(meta, f)
+
+    sep_note = f" sep_id={default_sep_token_id(VOCAB_SIZE)}" if USE_QUERY_SEP else ""
+    print(
+        f"[{basename}] vocab={VOCAB_SIZE} ctx_pairs={pool_pairs} queries={num_queries} "
+        f"seq_len={seq_len}{sep_note} supervised={num_queries}/{seq_len} -> {outdir}"
+    )
 
 
 if __name__ == '__main__':

@@ -76,7 +76,10 @@ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch si
 block_size = 1024
 block_align = False # if True, snap each random window to a multiple of block_size
                     # (for fixed-length self-contained examples, e.g. MQAR; native path only)
-ar_eval_acc = False # if True, also report recall accuracy at MQAR answer positions
+mqar_masked = False # Zoology MQAR: load {split}_inputs.bin + {split}_labels.bin;
+                    # labels use -100 on non-answer positions; no extra NTP shift in get_batch
+mqar_ignore_index = -100
+ar_eval_acc = False # legacy fixed-position MQAR accuracy (pre-Zoology contiguous queries)
 ar_num_queries = 0  # number of trailing (query,answer) pairs per example; answers are
                     # predicted at local positions [block_size-2*Q + 2*t for t in 0..Q-1]
 # model (SwiGLU MLP, RMSNorm, no biases, tied embeds; mixer chosen below)
@@ -189,8 +192,6 @@ def get_batch(split):
     # AFTER model init), so changing the architecture (and thus the number of RNG
     # draws consumed by model init) doesn't shift the data sequence. Every arch
     # sees identical batches at every iter for the same (seed, ddp_rank, split).
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     # Route val draws through _val_rng (reseeded per estimate_loss call → fixed val set).
     rng = _val_rng if split == 'val' else data_rng
     if use_megatron:
@@ -212,6 +213,21 @@ def get_batch(split):
             y_list.append(torch.from_numpy(stream[i+1:i+1+block_size].astype(np.int64)))
         x = torch.stack(x_list)
         y = torch.stack(y_list)
+    elif mqar_masked:
+        x_path = os.path.join(data_dir, f'{split}_inputs.bin')
+        y_path = os.path.join(data_dir, f'{split}_labels.bin')
+        x_data = np.memmap(x_path, dtype=np.int32, mode='r')
+        y_data = np.memmap(y_path, dtype=np.int32, mode='r')
+        n_examples = len(x_data) // block_size
+        ix = torch.randint(n_examples, (batch_size,), generator=rng)
+        x = torch.stack([
+            torch.from_numpy(x_data[i * block_size:(i + 1) * block_size].astype(np.int64))
+            for i in ix.tolist()
+        ])
+        y = torch.stack([
+            torch.from_numpy(y_data[i * block_size:(i + 1) * block_size].astype(np.int64))
+            for i in ix.tolist()
+        ])
     elif split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
         ix = torch.randint(len(data) - block_size, (batch_size,), generator=rng)
@@ -237,7 +253,7 @@ def get_batch(split):
 iter_num = 0
 best_val_loss = 1e9
 
-# attempt to derive vocab_size from the dataset (only when not using Megatron + explicit vocab)
+# attempt to derive vocab_size / mqar_masked from the dataset meta
 meta_vocab_size = None
 if vocab_size is None and not use_megatron:
     meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -245,6 +261,10 @@ if vocab_size is None and not use_megatron:
         with open(meta_path, 'rb') as f:
             meta = pickle.load(f)
         meta_vocab_size = meta['vocab_size']
+        if mqar_masked is False and meta.get('mqar_masked'):
+            mqar_masked = True
+        if meta.get('ignore_index') is not None:
+            mqar_ignore_index = meta['ignore_index']
         print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
@@ -318,6 +338,33 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+raw_model = model.module if ddp else model
+
+def _checkpoint_model_state():
+    state_dict = raw_model.state_dict()
+    unwanted_prefix = '_orig_mod.'
+    for k, v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    return state_dict
+
+def save_training_checkpoint(tag=''):
+    if not (master_process and save_checkpoint):
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    checkpoint = {
+        'model': _checkpoint_model_state(),
+        'optimizer': optimizer.state_dict(),
+        'model_args': model_args,
+        'iter_num': iter_num,
+        'best_val_loss': best_val_loss,
+        'config': config,
+    }
+    torch.save(checkpoint, ckpt_path)
+    suffix = f' ({tag})' if tag else ''
+    print(f'saved checkpoint to {ckpt_path}{suffix}')
+
 # Fixed-set validation loss. _val_rng is reseeded at the start of every call so
 # every eval iterates over the same (rank-sharded) sequence of val positions.
 # Across DDP ranks the union covers world_size * eval_iters * batch_size * block_size
@@ -326,6 +373,7 @@ if ddp:
 def estimate_loss():
     _val_rng.manual_seed(val_seed + ddp_rank)
     model.eval()
+    raw = model.module if ddp else model
     losses = torch.zeros(eval_iters, device=device)
     for k in range(eval_iters):
         X, Y = get_batch('val')
@@ -336,20 +384,29 @@ def estimate_loss():
     if ddp:
         torch.distributed.all_reduce(val_loss, op=torch.distributed.ReduceOp.AVG)
     out = {'val': val_loss.item()}
-    # Optional: recall accuracy at MQAR answer positions (answers are tiny fraction
-    # of a long sequence, so val loss alone won't reveal retrieval ability).
-    if ar_eval_acc and ar_num_queries > 0:
+    # Zoology MQAR: masked CE is the main metric; also report answer-token accuracy.
+    if mqar_masked:
+        accs = torch.zeros(eval_iters, device=device)
+        for k in range(eval_iters):
+            X, Y = get_batch('val')
+            with ctx:
+                accs[k] = raw.masked_answer_accuracy(X, Y, ignore_index=mqar_ignore_index)
+        val_acc = accs.mean()
+        if ddp:
+            torch.distributed.all_reduce(val_acc, op=torch.distributed.ReduceOp.AVG)
+        out['val_acc'] = val_acc.item()
+    # Legacy contiguous-query MQAR layout (pre-Zoology bins).
+    elif ar_eval_acc and ar_num_queries > 0:
         base = block_size - 2 * ar_num_queries
-        positions = torch.arange(base, block_size - 1, 2, device=device)  # query-key positions
-        raw = model.module if ddp else model
+        positions = torch.arange(base, block_size - 1, 2, device=device)
         correct = torch.zeros((), device=device)
         total = torch.zeros((), device=device)
         for k in range(eval_iters):
             X, Y = get_batch('val')
             with ctx:
-                lg = raw.logits_at(X, positions)          # [B, Q, V]
+                lg = raw.logits_at(X, positions)
             pred = lg.argmax(dim=-1)
-            tgt = Y[:, positions]                          # answer tokens
+            tgt = Y[:, positions]
             correct += (pred == tgt).sum()
             total += tgt.numel()
         if ddp:
@@ -398,7 +455,6 @@ _val_rng = torch.Generator()
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 # rolling buffer of per-iter losses; averaged + flushed every train_loss_log_interval iters
 running_loss_buf = []
@@ -426,6 +482,11 @@ while True:
                 if 'val_acc' in losses:
                     log_d["val/acc"] = losses['val_acc']
                 wandb.log(log_d, step=iter_num)
+            if save_checkpoint and (losses['val'] < best_val_loss or always_save_checkpoint):
+                improved = losses['val'] < best_val_loss
+                if improved:
+                    best_val_loss = losses['val']
+                save_training_checkpoint(tag=f'iter {iter_num}')
     if iter_num == 0 and eval_only:
         break
 
@@ -501,6 +562,8 @@ while True:
 
     # termination conditions
     if iter_num > max_iters:
+        if master_process and save_checkpoint:
+            save_training_checkpoint(tag='final')
         break
 
 if ddp:

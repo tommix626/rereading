@@ -169,7 +169,7 @@ class GPT(nn.Module):
 
         # Fused linear + cross-entropy (avoids materializing the (B·T, V) logits tensor,
         # which at our 8×4096×100352 fp32 shape is ~13 GB and OOMs activation memory).
-        self.loss_fn = FusedLinearCrossEntropyLoss(ignore_index=-1)
+        self.loss_fn = FusedLinearCrossEntropyLoss(ignore_index=-100)
 
         self.apply(self._init_weights)
         # Depth-scaled re-init for output projections (Block.attn.{c,o}_proj, Block.mlp.c_proj).
@@ -215,6 +215,18 @@ class GPT(nn.Module):
         # inference-time mini-opt: only forward the lm_head on the last position
         logits = self.lm_head(x[:, [-1], :])
         return logits, None
+
+    @torch.no_grad()
+    def masked_answer_accuracy(self, idx, labels, ignore_index=-100):
+        """Fraction correct on supervised (non-ignore_index) label positions."""
+        x = self.transformer.wte(idx)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        mask = labels != ignore_index
+        pred = logits.argmax(dim=-1)
+        return (pred[mask] == labels[mask]).float().mean()
 
     @torch.no_grad()
     def logits_at(self, idx, positions):

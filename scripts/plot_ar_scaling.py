@@ -78,17 +78,18 @@ def main():
             axT.plot(it, smooth(tl), color=color, lw=1.6, label=tag)
             axV.plot(st, vl, color=color, lw=2.0, marker='o', ms=3, label=tag)
 
-    # reference lines
+    # reference: masked CE on answer tokens only (Zoology MQAR)
     for ax in (axT, axV):
-        ax.axhline(np.log(NUM_VALS), color='gray', ls='--', lw=1,
-                   label=f'recall baseline ln({NUM_VALS})={np.log(NUM_VALS):.2f}')
+        ax.axhline(np.log(VOCAB // 2), color='gray', ls='--', lw=1,
+                   label=f'no recall ln(V/2)={np.log(VOCAB // 2):.2f}')
+        ax.axhline(0.0, color='gray', ls=':', lw=1, label='perfect recall')
         ax.set_xlabel('iteration')
         ax.grid(alpha=0.25)
     axT.set_ylabel('loss (nats)')
     axT.set_title('Training loss (smoothed)')
     axV.set_title('Validation loss')
     axV.legend(fontsize=8, loc='upper right', ncol=1)
-    fig.suptitle('MQAR associative recall: GDN vs softmax across model size\n'
+    fig.suptitle('Zoology MQAR: GDN vs softmax across model size (masked CE)\n'
                  '(reds=GDN, blues=softmax; light->dark = small->large)',
                  fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.93])

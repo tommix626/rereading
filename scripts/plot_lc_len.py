@@ -19,27 +19,43 @@ ACC_RE = re.compile(r'step (\d+): val/loss [\d.]+ val/acc ([\d.]+)')
 
 def parse(path):
     st, ac = [], []
-    if os.path.exists(path):
-        with open(path) as f:
-            for line in f:
-                m = ACC_RE.search(line)
-                if m:
-                    st.append(int(m.group(1))); ac.append(float(m.group(2)))
-    return np.array(st), np.array(ac)
+    if not os.path.exists(path):
+        return np.array(st), np.array(ac), 'missing'
+    with open(path) as f:
+        text = f.read()
+    for line in text.splitlines():
+        m = ACC_RE.search(line)
+        if m:
+            st.append(int(m.group(1))); ac.append(float(m.group(2)))
+    if 'Killed' in text or 'CANCELLED' in text or 'Force Terminated' in text:
+        status = 'killed' if len(ac) else 'revoked'
+    elif len(ac) and st[-1] >= 19000:
+        status = 'complete'
+    elif len(ac):
+        status = 'partial'
+    else:
+        status = 'empty'
+    return np.array(st), np.array(ac), status
 
 
 def main():
     mixers = {'gdn': ('GDN', 'C3', plt.cm.Reds), 'softmax': ('softmax', 'C0', plt.cm.Blues)}
     shades = {s: 0.4 + 0.5 * i / (len(SEQS) - 1) for i, s in enumerate(SEQS)}
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5.2))
+    fig, (axL, axR, axZ) = plt.subplots(1, 3, figsize=(17, 5.2))
 
     for key, (label, c, cmap) in mixers.items():
         finals = []
         for S in SEQS:
-            st, ac = parse(os.path.join(LOGDIR, f'lc2_{key}_s{S}_q1.log'))
+            path = os.path.join(LOGDIR, f'lc2_{key}_s{S}_q1.log')
+            st, ac, status = parse(path)
             finals.append(ac[-1] if len(ac) else np.nan)
             if len(ac):
-                axR.plot(st, ac, color=cmap(shades[S]), lw=2, label=f'{label} S={S}')
+                ls = '-' if status == 'complete' else '--'
+                tag = '' if status == 'complete' else f' ({status}@{st[-1]})'
+                axR.plot(st, ac, color=cmap(shades[S]), lw=2, ls=ls,
+                         label=f'{label} S={S}{tag}')
+                axZ.plot(st, ac, color=cmap(shades[S]), lw=2, ls=ls,
+                         label=f'{label} S={S}{tag}')
         axL.plot(SEQS, finals, color=c, lw=2.4, marker='o', ms=8, label=label)
 
     axL.axhline(1.0, color='gray', ls=':', lw=1)
@@ -50,8 +66,13 @@ def main():
     axL.legend(); axL.grid(alpha=0.25)
 
     axR.set_xlabel('iteration'); axR.set_ylabel('recall accuracy'); axR.set_ylim(-0.03, 1.03)
-    axR.set_title('Accuracy curves (reds=GDN, blues=softmax; light->dark=longer S)')
-    axR.legend(fontsize=8, ncol=2); axR.grid(alpha=0.25)
+    axR.set_title('Full training curves')
+    axR.legend(fontsize=7, ncol=2); axR.grid(alpha=0.25)
+
+    axZ.set_xlim(0, 5000); axZ.set_ylim(-0.03, 1.05)
+    axZ.set_xlabel('iteration'); axZ.set_ylabel('recall accuracy')
+    axZ.set_title('Zoom: first 5k iters (learning phase)')
+    axZ.legend(fontsize=7, ncol=2); axZ.grid(alpha=0.25)
 
     fig.suptitle('Associative recall vs context length: attention vs GDN (d256, Q=1)', fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
@@ -61,8 +82,8 @@ def main():
     for key, (label, _, _) in mixers.items():
         row = []
         for S in SEQS:
-            _, ac = parse(os.path.join(LOGDIR, f'lc2_{key}_s{S}_q1.log'))
-            row.append(f'S{S}={ac[-1]:.3f}' if len(ac) else f'S{S}=NA')
+            _, ac, status = parse(os.path.join(LOGDIR, f'lc2_{key}_s{S}_q1.log'))
+            row.append(f'S{S}={ac[-1]:.3f} ({status})' if len(ac) else f'S{S}=NA ({status})')
         print(f'  {label:8s}: ' + '  '.join(row))
 
 
