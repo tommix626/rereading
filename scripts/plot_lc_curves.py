@@ -21,7 +21,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGDIR = os.path.join(ROOT, 'slurm')
 PREFIX = sys.argv[1] if len(sys.argv) > 1 else 'lc3'
 SEQS = [int(x) for x in (sys.argv[2].split(',') if len(sys.argv) > 2 else ['16', '32', '64', '128'])]
-VOCAB = 2048
+# vocab only feeds the "no-recall" chance reference line; lc4 bumped it to 8192.
+VOCAB = int(sys.argv[3]) if len(sys.argv) > 3 else (8192 if PREFIX == 'lc4' else 2048)
 
 VAL_RE = re.compile(r'step (\d+): val/loss ([\d.]+) val/acc ([\d.]+)')
 TRAIN_RE = re.compile(r'step (\d+): train/loss \(avg over last \d+ iters\) = ([\d.]+)')
@@ -80,7 +81,8 @@ def parse(path):
 
 
 def queries_for(S):
-    return 1 if PREFIX == 'lc3' else S // 4
+    # mq4 uses Q=S/4; length-sweeps (lc3/lc4) are single-query.
+    return S // 4 if PREFIX == 'mq4' else 1
 
 
 def log_path(mixer, S):
@@ -183,9 +185,13 @@ def main():
     ax_sum.legend(fontsize=8)
     ax_sum.grid(alpha=0.25, axis='y')
 
-    q_note = 'Q=1' if PREFIX == 'lc3' else 'Q=S/4 (context pairs)'
+    q_note = 'Q=S/4 (context pairs)' if PREFIX == 'mq4' else 'Q=1'
+    model_note = {'lc3': 'd256 4L', 'lc4': 'd256 4L', 'mq4': 'd256 4L', 'lc5': 'd64 2L'}.get(PREFIX, '')
+    train_note = {'lc3': '400k train', 'mq4': '400k train',
+                  'lc4': '5.12M train', 'lc5': '5.12M train'}.get(PREFIX, '')
+    cfg = ', '.join(x for x in (model_note, 'batch=256', train_note, f'vocab={VOCAB}') if x)
     fig.suptitle(
-        f'MQAR sweep [{PREFIX}] ({q_note}, masked CE, d256, batch=256, 400k train): GDN vs softmax\n'
+        f'MQAR sweep [{PREFIX}] ({q_note}, masked CE, {cfg}): GDN vs softmax\n'
         f'reds=GDN, blues=softmax; light→dark = smaller→larger S',
         fontsize=12,
     )

@@ -38,6 +38,11 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
+# If True, write full (resumable, incl. optimizer) checkpoints `ckpt_iter{N}.pt`
+# (never overwritten) every `snapshot_interval` steps, so the grokking trajectory
+# can be replayed for per-position / per-token error analysis or resumed from.
+snapshot_checkpoints = False
+snapshot_interval = 500  # steps between snapshots (independent of eval_interval)
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # Logging / eval (ported from nanoGPTLead fb93fc5 / 2026-05-13).
 # `train_loss_log_interval` controls the running-window train/loss metric
@@ -82,6 +87,16 @@ mqar_ignore_index = -100
 ar_eval_acc = False # legacy fixed-position MQAR accuracy (pre-Zoology contiguous queries)
 ar_num_queries = 0  # number of trailing (query,answer) pairs per example; answers are
                     # predicted at local positions [block_size-2*Q + 2*t for t in 0..Q-1]
+# Online MQAR: generate fresh examples at training time (infinite data, no dataset dir).
+# Uses the upstream zoology generator; each train example is seen exactly once.
+online_mqar = False
+online_num_kv_pairs = 4
+online_power_a = 0.01
+online_random_non_queries = False
+online_chunk = 8192  # examples generated per refresh (amortizes gen cost; each used once)
+# Early stopping on tail-mean val accuracy (mainly for online runs).
+early_stop_acc = -1.0     # >0 enables; stop once mean of last `early_stop_window` evals ≥ this
+early_stop_window = 3
 # model (SwiGLU MLP, RMSNorm, no biases, tied embeds; mixer chosen below)
 n_layer = 12
 n_embd = 768
@@ -102,6 +117,8 @@ gdn_allow_neg_eigval = False
 # Softmax-attention config (used when mixer='softmax')
 n_head = 12
 rope_theta = 10000.0
+use_rope = True  # False → NoPE (no positional encoding), for the softmax path
+use_learned_pos_emb = False  # True → GPT-2 learned absolute pos-emb (Zoology attention baseline)
 # (no `bias` / `dropout` — the new model removes both)
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -187,6 +204,30 @@ if use_megatron:
     _train_weights_np = normalize_weights(_train_weights)
     _val_weights_np = normalize_weights(_val_weights) if _val_paths is not None else None
 
+# ---- Online MQAR generation (infinite data via the upstream zoology generator) ----
+_online = {}
+if online_mqar:
+    import sys as _sys
+    _zoo_repo = os.environ.get('ZOO_REPO', '/data/cl/u/xwang397/zoology')
+    if _zoo_repo not in _sys.path:
+        _sys.path.insert(0, _zoo_repo)
+    from zoology.data.multiquery_ar import multiquery_ar as _zoo_mqar
+
+    def _online_gen(n, seed):
+        seg = _zoo_mqar(vocab_size=vocab_size, num_examples=int(n), input_seq_len=block_size,
+                        seed=int(seed), power_a=online_power_a, num_kv_pairs=online_num_kv_pairs,
+                        num_passes=1, random_non_queries=online_random_non_queries)
+        return (seg.inputs.numpy().astype(np.int64), seg.labels.numpy().astype(np.int64))
+
+    _online['gen'] = _online_gen
+    _online['train_seed'] = 100003 * (seed_offset + 1)   # disjoint stream per rank
+    _online['bx'], _online['by'], _online['cur'] = None, None, 0
+    # Fixed val buffer for a stable early-stopping signal (regenerated never).
+    _online['vx'], _online['vy'] = _online_gen(max(3000, eval_iters * batch_size),
+                                               seed=7000003 + seed_offset)
+    print(f"[online] zoology gen: kv={online_num_kv_pairs} seqlen={block_size} vocab={vocab_size} "
+          f"rnq={online_random_non_queries} chunk={online_chunk}", flush=True)
+
 def get_batch(split):
     # All random ops route through `data_rng` (a dedicated torch.Generator seeded
     # AFTER model init), so changing the architecture (and thus the number of RNG
@@ -194,7 +235,20 @@ def get_batch(split):
     # sees identical batches at every iter for the same (seed, ddp_rank, split).
     # Route val draws through _val_rng (reseeded per estimate_loss call → fixed val set).
     rng = _val_rng if split == 'val' else data_rng
-    if use_megatron:
+    if online_mqar:
+        if split == 'val':
+            bx, by = _online['vx'], _online['vy']
+            ix = torch.randint(bx.shape[0], (batch_size,), generator=rng).tolist()
+        else:
+            if _online['bx'] is None or _online['cur'] + batch_size > _online['bx'].shape[0]:
+                _online['bx'], _online['by'] = _online['gen'](online_chunk, _online['train_seed'])
+                _online['train_seed'] += 1
+                _online['cur'] = 0
+            s = _online['cur']; ix = list(range(s, s + batch_size)); _online['cur'] += batch_size
+            bx, by = _online['bx'], _online['by']
+        x = torch.from_numpy(bx[ix].copy())
+        y = torch.from_numpy(by[ix].copy())
+    elif use_megatron:
         if split == 'train':
             paths, weights_np = _train_paths, _train_weights_np
         else:
@@ -276,7 +330,8 @@ model_args = dict(
     gdn_expand_v=gdn_expand_v, gdn_mode=gdn_mode, gdn_use_gate=gdn_use_gate,
     gdn_use_short_conv=gdn_use_short_conv, gdn_conv_size=gdn_conv_size,
     gdn_allow_neg_eigval=gdn_allow_neg_eigval,
-    n_head=n_head, rope_theta=rope_theta,
+    n_head=n_head, rope_theta=rope_theta, use_rope=use_rope,
+    use_learned_pos_emb=use_learned_pos_emb,
 )
 if init_from == 'scratch':
     # init a new model from scratch
@@ -302,7 +357,7 @@ elif init_from == 'resume':
               'gdn_head_dim', 'gdn_num_heads', 'gdn_num_v_heads',
               'gdn_expand_v', 'gdn_mode', 'gdn_use_gate', 'gdn_use_short_conv',
               'gdn_conv_size', 'gdn_allow_neg_eigval',
-              'n_head', 'rope_theta']:
+              'n_head', 'rope_theta', 'use_rope', 'use_learned_pos_emb']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     gptconf = GPTConfig(**model_args)
@@ -348,11 +403,11 @@ def _checkpoint_model_state():
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     return state_dict
 
-def save_training_checkpoint(tag=''):
+def save_training_checkpoint(tag='', fname='ckpt.pt'):
     if not (master_process and save_checkpoint):
         return
     os.makedirs(out_dir, exist_ok=True)
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, fname)
     checkpoint = {
         'model': _checkpoint_model_state(),
         'optimizer': optimizer.state_dict(),
@@ -458,7 +513,9 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 running_mfu = -1.0
 # rolling buffer of per-iter losses; averaged + flushed every train_loss_log_interval iters
 running_loss_buf = []
+_val_acc_hist = []  # tail-mean early stopping (online runs)
 while True:
+    should_stop = False
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -469,6 +526,12 @@ while True:
     # shard); all-reduce inside estimate_loss gives the global mean. Logged from master.
     if eval_during_training and iter_num % eval_interval == 0:
         losses = estimate_loss()
+        # tail-mean early stopping (val_acc is already all-reduced across ranks)
+        if early_stop_acc > 0 and 'val_acc' in losses:
+            _val_acc_hist.append(losses['val_acc'])
+            if (len(_val_acc_hist) >= early_stop_window and
+                    sum(_val_acc_hist[-early_stop_window:]) / early_stop_window >= early_stop_acc):
+                should_stop = True
         if master_process:
             acc_str = f" val/acc {losses['val_acc']:.4f}" if 'val_acc' in losses else ""
             print(f"step {iter_num}: val/loss {losses['val']:.4f}{acc_str}")
@@ -487,7 +550,20 @@ while True:
                 if improved:
                     best_val_loss = losses['val']
                 save_training_checkpoint(tag=f'iter {iter_num}')
+    # Full (resumable) checkpoint snapshot at its own cadence (independent of eval),
+    # so grokking transitions can be probed at fine resolution offline / resumed from.
+    if save_checkpoint and snapshot_checkpoints and iter_num % snapshot_interval == 0:
+        save_training_checkpoint(tag=f'snapshot iter {iter_num}',
+                                 fname=f'ckpt_iter{iter_num}.pt')
     if iter_num == 0 and eval_only:
+        break
+    if should_stop:
+        if master_process:
+            tail = sum(_val_acc_hist[-early_stop_window:]) / early_stop_window
+            print(f"early-stop at step {iter_num}: tail-mean val/acc ({tail:.4f}) "
+                  f">= {early_stop_acc} over last {early_stop_window} evals")
+            if save_checkpoint:
+                save_training_checkpoint(tag='earlystop')
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size

@@ -51,6 +51,7 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.c_v = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.use_rope = config.use_rope
         cos, sin = _precompute_rope_freqs(self.head_dim, config.block_size, config.rope_theta)
         self.register_buffer('rope_cos', cos, persistent=False)
         self.register_buffer('rope_sin', sin, persistent=False)
@@ -60,8 +61,9 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        q = _apply_rope(q, self.rope_cos, self.rope_sin)
-        k = _apply_rope(k, self.rope_cos, self.rope_sin)
+        if self.use_rope:
+            q = _apply_rope(q, self.rope_cos, self.rope_sin)
+            k = _apply_rope(k, self.rope_cos, self.rope_sin)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
@@ -146,6 +148,8 @@ class GPTConfig:
     # Softmax-attention config (used when mixer='softmax')
     n_head: int = 12
     rope_theta: float = 10000.0
+    use_rope: bool = True  # False → NoPE (no positional encoding at all)
+    use_learned_pos_emb: bool = False  # True → GPT-2 style learned absolute pos-emb (Zoology attention)
 
 
 class GPT(nn.Module):
@@ -163,6 +167,9 @@ class GPT(nn.Module):
             h=nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layer)]),
             ln_f=nn.RMSNorm(config.n_embd, eps=config.norm_eps),
         ))
+        if config.use_learned_pos_emb:
+            # GPT-2 style learned absolute positional embeddings (Zoology attention baseline).
+            self.transformer['wpe'] = nn.Embedding(config.block_size, config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # Tied embeddings (already standard in nanoGPT)
         self.transformer.wte.weight = self.lm_head.weight
@@ -197,16 +204,22 @@ class GPT(nn.Module):
             # Linear children (q/k/v/a/b/o_proj) are caught by the nn.Linear branch.
             pass
 
-    def forward(self, idx, targets=None):
+    def _backbone(self, idx):
+        """Shared embed → blocks → final-norm. Used by forward/accuracy/logits_at so
+        the (optional) learned positional embedding is applied consistently."""
         b, t = idx.size()
         assert t <= self.config.block_size, (
             f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         )
-
         x = self.transformer.wte(idx)
+        if self.config.use_learned_pos_emb:
+            x = x + self.transformer.wpe(torch.arange(t, device=idx.device))
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        return self.transformer.ln_f(x)
+
+    def forward(self, idx, targets=None):
+        x = self._backbone(idx)
 
         if targets is not None:
             # Fused path: never materializes the full [B·T, V] logits tensor.
@@ -219,10 +232,7 @@ class GPT(nn.Module):
     @torch.no_grad()
     def masked_answer_accuracy(self, idx, labels, ignore_index=-100):
         """Fraction correct on supervised (non-ignore_index) label positions."""
-        x = self.transformer.wte(idx)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self._backbone(idx)
         logits = self.lm_head(x)
         mask = labels != ignore_index
         pred = logits.argmax(dim=-1)
@@ -234,10 +244,7 @@ class GPT(nn.Module):
         indices, shared across the batch). Returns [B, len(positions), vocab].
         Used to score answer-position recall accuracy without materializing the
         full [B, T, vocab] logits tensor."""
-        x = self.transformer.wte(idx)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self._backbone(idx)
         return self.lm_head(x[:, positions, :])
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, eps=1e-8):

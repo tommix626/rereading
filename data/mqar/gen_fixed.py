@@ -23,6 +23,8 @@ import os
 import pickle
 import sys
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from zoology import IGNORE_INDEX, build_pool_examples, default_sep_token_id, write_split_bins
 
@@ -33,6 +35,8 @@ USE_QUERY_SEP = os.environ.get('USE_QUERY_SEP', '1') not in ('0', 'false', 'Fals
 RANDOM_NON_QUERIES = os.environ.get('RANDOM_NON_QUERIES', '1') not in ('0', 'false', 'False')
 SEED = int(os.environ.get('SEED', '11'))
 _DATASET_TAG = os.environ.get('DATASET_TAG', '')
+# Generate/write in chunks so peak RAM stays bounded for very large N (e.g. lc5).
+CHUNK_SIZE = int(os.environ.get('CHUNK_SIZE', '2000000'))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -63,6 +67,27 @@ def resolve_sizing():
     return seq_len, pool_pairs, num_queries, name
 
 
+def write_split_chunked(outdir, split, n_total, base_seed, kw):
+    """Generate a split in CHUNK_SIZE batches (distinct seed per chunk) and stream
+    int32 bins to disk, so peak RAM is bounded by one chunk regardless of n_total."""
+    os.makedirs(outdir, exist_ok=True)
+    x_path = os.path.join(outdir, f'{split}_inputs.bin')
+    y_path = os.path.join(outdir, f'{split}_labels.bin')
+    written = 0
+    ci = 0
+    with open(x_path, 'wb') as fx, open(y_path, 'wb') as fy:
+        while written < n_total:
+            n = min(CHUNK_SIZE, n_total - written)
+            xi, yi = build_pool_examples(n, seed=base_seed + ci, **kw)
+            xi.astype(np.int32).tofile(fx)
+            yi.astype(np.int32).tofile(fy)
+            written += n
+            ci += 1
+            if n_total > CHUNK_SIZE:
+                print(f"  [{split}] {written:,}/{n_total:,} ({ci} chunks)", flush=True)
+    return written
+
+
 def main():
     seq_len, pool_pairs, num_queries, basename = resolve_sizing()
     outdir = os.path.join(HERE, '..', basename)
@@ -74,12 +99,10 @@ def main():
         random_non_queries=RANDOM_NON_QUERIES,
         use_query_sep=USE_QUERY_SEP,
     )
-    train_in, train_lab = build_pool_examples(N_TRAIN, seed=SEED + 1, **kw)
-    val_in, val_lab = build_pool_examples(N_VAL, seed=SEED + 2, **kw)
-
     os.makedirs(outdir, exist_ok=True)
-    write_split_bins(outdir, 'train', train_in, train_lab)
-    write_split_bins(outdir, 'val', val_in, val_lab)
+    # base seeds offset far apart so train chunk seeds never collide with val's.
+    write_split_chunked(outdir, 'train', N_TRAIN, SEED + 10000, kw)
+    write_split_chunked(outdir, 'val', N_VAL, SEED + 2, kw)
 
     meta = {
         'vocab_size': VOCAB_SIZE,
