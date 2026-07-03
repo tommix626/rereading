@@ -1,19 +1,24 @@
-r"""fnl1: compact, K/Q-parametrized MQAR (final suite).
+r"""fnl2: compact, K/Q-parametrized MQAR (final suite).
 
 Each example (length 2K + 2Q):
     context (2K):   k0 v0 k1 v1 ... k_{K-1} v_{K-1}     (K key-value pairs, packed)
-    queries (2Q):   q0  0 q1  0 ... q_{Q-1}  0          (Q queries, 0-filler after each)
+    queries (2Q):   q0  r q1  r ... q_{Q-1}  r          (Q queries; r = random filler)
   - q_j is one of the K keys; the label at the q_j POSITION is that key's value
     (no next-token shift; matches our mqar_masked loss / masked_answer_accuracy).
-  - all other positions (context, 0-fillers) are labeled -100 (ignored).
-  - keys in [1, V/2), values in [V/2, V); 0 reserved for filler/pad. Clean 0-padding
-    (no random distractors) -> use RoPE, not learned-APE (see reports/mq5_ape_cleanpad_plateau.md).
+  - all other positions (context, fillers) are labeled -100 (ignored).
+  - keys in [1, V/2), values in [V/2, V).
+  - RANDOM_NON_QUERIES=1 (default): filler slots hold RANDOM distractor tokens. This is
+    the fnl2 FIX: clean 0-padding (RANDOM_NON_QUERIES=0) is pathological for softmax --
+    it plateaus at 1/K (value-copying without matching), and RoPE does NOT rescue the
+    compact layout. Random fillers force content-based retrieval -> softmax groks to ~1.0.
+    (See reports/mq5_ape_cleanpad_plateau.md.)
   - queries: Q distinct pairs (without replacement) if Q<=K, else with replacement.
 
-Writes data/mqar_fnl1_k{K}_q{Q}/ with {train,val}_{inputs,labels}.bin (int32) + meta.pkl.
+Writes data/mqar_{NAME_PREFIX}_k{K}_q{Q}/ with {train,val}_{inputs,labels}.bin + meta.pkl.
 
-Env: K (required), Q (default K), VOCAB_SIZE=8192, N_TRAIN=400000, N_VAL=3000, SEED=1234, CHUNK=20000
-Usage: K=16 python data/mqar/gen_fnl1.py     (or KS handled by the sweep's gen step)
+Env: K (required), Q (default K), VOCAB_SIZE=8192, N_TRAIN=400000, N_VAL=3000, SEED=1234,
+     CHUNK=20000, RANDOM_NON_QUERIES=1, NAME_PREFIX=fnl2
+Usage: K=16 python data/mqar/gen_fnl2.py
 """
 import os, pickle
 import numpy as np
@@ -26,8 +31,8 @@ CHUNK = int(os.environ.get("CHUNK", "20000"))
 # fnl2 fix: fill the query-region filler slots with RANDOM distractor tokens instead of 0.
 # Clean 0-padding is pathological for softmax (1/K value-copying plateau); random fillers
 # force content-based retrieval (proven in reports/mq5_ape_cleanpad_plateau.md).
-RANDOM_NON_QUERIES = os.environ.get("RANDOM_NON_QUERIES", "0") not in ("0", "false", "False")
-NAME_PREFIX = os.environ.get("NAME_PREFIX", "fnl1")
+RANDOM_NON_QUERIES = os.environ.get("RANDOM_NON_QUERIES", "1") not in ("0", "false", "False")
+NAME_PREFIX = os.environ.get("NAME_PREFIX", "fnl2")
 IGNORE = -100
 HERE = os.path.dirname(os.path.abspath(__file__))
 
